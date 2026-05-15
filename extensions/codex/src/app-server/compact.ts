@@ -164,7 +164,6 @@ async function compactCodexNativeThread(
       tokensBefore: params.currentTokenCount ?? 0,
       details: {
         backend: "codex-app-server",
-        ownsCompaction: params.contextEngine?.info?.ownsCompaction === true,
         threadId: binding.threadId,
         signal: completion.signal,
         turnId: completion.turnId,
