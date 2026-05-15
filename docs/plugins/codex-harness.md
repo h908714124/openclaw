@@ -119,6 +119,12 @@ Use `openai/gpt-*` model refs for Codex-backed OpenAI agent turns. Prefer
 `openai-codex:*` auth profiles and `auth.order.openai-codex` remain valid, but
 do not write new `openai-codex/gpt-*` model refs.
 
+Do not set `agents.defaults.compaction.model` or
+`agents.defaults.compaction.provider` for Codex-backed agents. Codex owns
+compaction through its native app-server thread state, so OpenClaw ignores those
+local summarizer overrides at runtime and `openclaw doctor --fix` removes them
+when the agent uses Codex.
+
 ```json5
 {
   auth: {

@@ -1,7 +1,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { HarnessContextEngine as ContextEngine } from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  embeddedAgentLog,
+  type HarnessContextEngine as ContextEngine,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexAppServerClientFactory } from "./client-factory.js";
 import type { CodexAppServerClient } from "./client.js";
@@ -155,6 +158,48 @@ describe("maybeCompactCodexAppServerSession", () => {
     await pendingResult;
 
     expect(seenAuthProfileId).toBe("openai-codex:work");
+  });
+
+  it("warns when stale OpenClaw compaction overrides are ignored", async () => {
+    const warn = vi.spyOn(embeddedAgentLog, "warn").mockImplementation(() => undefined);
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    const pendingResult = maybeCompactCodexAppServerSession({
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile,
+      workspaceDir: tempDir,
+      config: {
+        agents: {
+          defaults: {
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+        },
+      },
+    });
+    await vi.waitFor(() => {
+      expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
+    });
+    fake.emit({
+      method: "thread/compacted",
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    });
+    await pendingResult;
+
+    expect(warn).toHaveBeenCalledWith(
+      "ignoring OpenClaw compaction overrides for Codex app-server compaction; Codex uses native server-side compaction",
+      {
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        ignoredConfig: ["agents.defaults.compaction.model", "agents.defaults.compaction.provider"],
+      },
+    );
+    warn.mockRestore();
   });
 
   it("fails closed when the persisted binding auth profile disagrees with the runtime request", async () => {

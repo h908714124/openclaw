@@ -26,6 +26,7 @@ type CodexNativeCompactionWaiter = {
 };
 
 const DEFAULT_CODEX_COMPACTION_WAIT_TIMEOUT_MS = 5 * 60 * 1000;
+const warnedIgnoredCompactionOverrides = new Set<string>();
 
 export async function maybeCompactCodexAppServerSession(
   params: CompactEmbeddedPiSessionParams,
@@ -34,6 +35,7 @@ export async function maybeCompactCodexAppServerSession(
   const activeContextEngine = isActiveHarnessContextEngine(params.contextEngine)
     ? params.contextEngine
     : undefined;
+  warnIfIgnoringOpenClawCompactionOverrides(params);
   const nativeResult = await compactCodexNativeThread(params, options);
   if (activeContextEngine && nativeResult?.ok && nativeResult.compacted) {
     try {
@@ -55,6 +57,50 @@ export async function maybeCompactCodexAppServerSession(
     }
   }
   return nativeResult;
+}
+
+function warnIfIgnoringOpenClawCompactionOverrides(params: CompactEmbeddedPiSessionParams): void {
+  const ignoredConfig = readIgnoredCompactionOverridePaths(params.config);
+  if (ignoredConfig.length === 0) {
+    return;
+  }
+  const warningKey = ignoredConfig.join("\0");
+  if (warnedIgnoredCompactionOverrides.has(warningKey)) {
+    return;
+  }
+  warnedIgnoredCompactionOverrides.add(warningKey);
+  embeddedAgentLog.warn(
+    "ignoring OpenClaw compaction overrides for Codex app-server compaction; Codex uses native server-side compaction",
+    {
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      ignoredConfig,
+    },
+  );
+}
+
+function readIgnoredCompactionOverridePaths(
+  config: CompactEmbeddedPiSessionParams["config"],
+): string[] {
+  const compaction = readRecord(readRecord(config?.agents)?.defaults)?.compaction;
+  const record = readRecord(compaction);
+  if (!record) {
+    return [];
+  }
+  const ignored: string[] = [];
+  if (typeof record.model === "string" && record.model.trim()) {
+    ignored.push("agents.defaults.compaction.model");
+  }
+  if (typeof record.provider === "string" && record.provider.trim()) {
+    ignored.push("agents.defaults.compaction.provider");
+  }
+  return ignored;
+}
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 async function compactCodexNativeThread(

@@ -134,6 +134,58 @@ describe("collectCodexRouteWarnings", () => {
     expect(warnings).toStrictEqual([]);
   });
 
+  it("warns when Codex runtime has OpenClaw compaction summarizer overrides", () => {
+    const warnings = collectCodexRouteWarnings({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+        },
+      } as OpenClawConfig,
+    });
+
+    expect(warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Run `openclaw doctor --fix`: it removes unsupported Codex compaction overrides.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("repairs Codex-runtime compaction summarizer overrides by removing them", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+              keepRecentTokens: 10_000,
+            },
+          },
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.warnings).toStrictEqual([]);
+    expect(result.changes).toStrictEqual([
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
+      "Removed agents.defaults.compaction.provider; Codex runtime uses native server-side compaction.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      keepRecentTokens: 10_000,
+    });
+  });
+
   it("repairs configured Codex model refs to canonical OpenAI refs with model-scoped Codex runtime", () => {
     const result = maybeRepairCodexRoutes({
       cfg: {
@@ -215,7 +267,6 @@ describe("collectCodexRouteWarnings", () => {
         "- agents.defaults.heartbeat.model: openai-codex/gpt-5.4-mini -> openai/gpt-5.4-mini.",
         "- agents.defaults.subagents.model.primary: openai-codex/gpt-5.5 -> openai/gpt-5.5.",
         "- agents.defaults.subagents.model.fallbacks.0: openai-codex/gpt-5.4 -> openai/gpt-5.4.",
-        "- agents.defaults.compaction.model: openai-codex/gpt-5.4 -> openai/gpt-5.4.",
         "- agents.defaults.compaction.memoryFlush.model: openai-codex/gpt-5.4-mini -> openai/gpt-5.4-mini.",
         "- agents.defaults.models.openai-codex/gpt-5.5: openai-codex/gpt-5.5 -> openai/gpt-5.5.",
         "- agents.list.worker.model: openai-codex/gpt-5.4 -> openai/gpt-5.4.",
@@ -231,6 +282,7 @@ describe("collectCodexRouteWarnings", () => {
       'Set agents.list.worker.models.openai/gpt-5.4.agentRuntime.id to "codex" so repaired OpenAI refs keep Codex auth routing.',
       "Removed agents.defaults.agentRuntime; runtime is now provider/model scoped.",
       "Removed agents.list.worker.agentRuntime; runtime is now provider/model scoped.",
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
     ]);
     expect(result.cfg.agents?.defaults?.model).toEqual({
       primary: "openai/gpt-5.5",
@@ -241,7 +293,7 @@ describe("collectCodexRouteWarnings", () => {
       primary: "openai/gpt-5.5",
       fallbacks: ["openai/gpt-5.4"],
     });
-    expect(result.cfg.agents?.defaults?.compaction?.model).toBe("openai/gpt-5.4");
+    expect(result.cfg.agents?.defaults?.compaction?.model).toBeUndefined();
     expect(result.cfg.agents?.defaults?.compaction?.memoryFlush?.model).toBe("openai/gpt-5.4-mini");
     expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
     expect(result.cfg.agents?.defaults?.models).toEqual({
