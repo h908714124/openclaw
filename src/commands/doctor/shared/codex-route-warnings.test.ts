@@ -186,6 +186,456 @@ describe("collectCodexRouteWarnings", () => {
     });
   });
 
+  it("keeps shared default compaction summarizer overrides for non-Codex agents", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+              keepRecentTokens: 10_000,
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+              models: {
+                "anthropic/claude-sonnet-4-6": { agentRuntime: { id: "pi" } },
+              },
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.changes).toStrictEqual([]);
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+      keepRecentTokens: 10_000,
+    });
+    expect(result.warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Move or remove shared `agents.defaults.compaction.model/provider` settings manually; doctor keeps shared defaults while non-Codex agents can inherit them.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("removes shared default compaction fields that non-Codex agents override", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+              keepRecentTokens: 10_000,
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+              compaction: {
+                model: "anthropic/claude-haiku-4-6",
+              },
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.changes).toStrictEqual([
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      provider: "lossless-claw",
+      keepRecentTokens: 10_000,
+    });
+    expect(result.warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Move or remove shared `agents.defaults.compaction.model/provider` settings manually; doctor keeps shared defaults while non-Codex agents can inherit them.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("keeps shared default compaction overrides when repairing legacy runtime pins", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai-codex/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+              agentRuntime: { id: "codex" },
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.cfg.agents?.defaults?.model).toBe("openai/gpt-5.5");
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+    });
+    expect(result.cfg.agents?.list?.[0]?.agentRuntime).toBeUndefined();
+    expect(result.changes.join("\n")).not.toContain("Removed agents.defaults.compaction");
+    expect(result.warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Move or remove shared `agents.defaults.compaction.model/provider` settings manually; doctor keeps shared defaults while non-Codex agents can inherit them.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("removes defaults when listed agents still have active Codex runtime pins", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+              agentRuntime: { id: "codex" },
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.warnings).toStrictEqual([]);
+    expect(result.changes).toStrictEqual([
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
+      "Removed agents.defaults.compaction.provider; Codex runtime uses native server-side compaction.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toBeUndefined();
+    expect(result.cfg.agents?.list?.[0]?.agentRuntime).toEqual({ id: "codex" });
+  });
+
+  it("does not clear active runtime pins for compaction-only legacy refs", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai-codex/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+              agentRuntime: { id: "codex" },
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.changes).toStrictEqual([
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
+      "Removed agents.defaults.compaction.provider; Codex runtime uses native server-side compaction.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toBeUndefined();
+    expect(result.cfg.agents?.defaults?.models).toBeUndefined();
+    expect(result.cfg.agents?.list?.[0]?.agentRuntime).toEqual({ id: "codex" });
+  });
+
+  it("keeps active runtime pins when shared compaction-only refs are preserved", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai-codex/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "codex-worker",
+              model: "anthropic/claude-sonnet-4-6",
+              agentRuntime: { id: "codex" },
+            },
+            {
+              id: "pi-worker",
+              model: "anthropic/claude-sonnet-4-6",
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.changes.join("\n")).toContain(
+      "agents.defaults.compaction.model: openai-codex/gpt-5.4 -> openai/gpt-5.4.",
+    );
+    expect(result.changes.join("\n")).not.toContain(
+      "Removed agents.list.codex-worker.agentRuntime",
+    );
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+    });
+    expect(result.cfg.agents?.list?.[0]?.agentRuntime).toEqual({ id: "codex" });
+  });
+
+  it("does not ignore active runtime pins for unrepaired stale refs", () => {
+    const cfg = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://proxy.example.test/v1",
+            models: [],
+          },
+        },
+      },
+      agents: {
+        defaults: {
+          model: "openai/gpt-5.5",
+          agentRuntime: { id: "codex" },
+          compaction: {
+            model: "openai/gpt-5.4",
+            provider: "lossless-claw",
+          },
+        },
+        list: [
+          {
+            id: "worker",
+            model: "anthropic/claude-sonnet-4-6",
+          },
+        ],
+      },
+      hooks: {
+        gmail: {
+          model: "openai-codex/gpt-5.4",
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(collectCodexRouteWarnings({ cfg })).toStrictEqual([
+      [
+        "- Legacy `openai-codex/*` model refs should be rewritten to `openai/*`.",
+        "- hooks.gmail.model: openai-codex/gpt-5.4 should become openai/gpt-5.4.",
+        "- Run `openclaw doctor --fix`: it rewrites configured model refs and stale sessions to `openai/*`, moves Codex intent to provider/model runtime policy, and clears old whole-agent runtime pins.",
+      ].join("\n"),
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Run `openclaw doctor --fix`: it removes unsupported Codex compaction overrides.",
+      ].join("\n"),
+    ]);
+
+    const result = maybeRepairCodexRoutes({
+      cfg,
+      shouldRepair: true,
+    });
+
+    expect(result.changes).toStrictEqual([
+      "Removed agents.defaults.compaction.model; Codex runtime uses native server-side compaction.",
+      "Removed agents.defaults.compaction.provider; Codex runtime uses native server-side compaction.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toBeUndefined();
+    expect(result.cfg.agents?.defaults?.agentRuntime).toEqual({ id: "codex" });
+    expect(result.cfg.hooks?.gmail?.model).toBe("openai-codex/gpt-5.4");
+  });
+
+  it("keeps default compaction overrides when route repair clears the default Codex pin", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "anthropic/claude-sonnet-4-6",
+            agentRuntime: { id: "codex" },
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+        },
+        hooks: {
+          gmail: {
+            model: "openai-codex/gpt-5.4",
+          },
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.warnings).toStrictEqual([]);
+    expect(result.changes).toStrictEqual([
+      "Repaired Codex model routes:\n- hooks.gmail.model: openai-codex/gpt-5.4 -> openai/gpt-5.4.",
+      "Removed agents.defaults.agentRuntime; runtime is now provider/model scoped.",
+    ]);
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+    });
+    expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
+    expect(result.cfg.hooks?.gmail?.model).toBe("openai/gpt-5.4");
+  });
+
+  it("keeps doctor fix hint for agent-specific compaction overrides", () => {
+    const warnings = collectCodexRouteWarnings({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "anthropic/claude-sonnet-4-6",
+            compaction: {
+              model: "openai/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "codex",
+              model: "openai/gpt-5.5",
+              compaction: {
+                model: "openai/gpt-5.4",
+              },
+            },
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+            },
+          ],
+        },
+      } as OpenClawConfig,
+    });
+
+    expect(warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.list.codex.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- Run `openclaw doctor --fix`: it removes unsupported Codex compaction overrides.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("canonicalizes kept shared default compaction model refs", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        agents: {
+          defaults: {
+            model: "openai/gpt-5.5",
+            compaction: {
+              model: "openai-codex/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+    });
+    expect(result.cfg.agents?.defaults?.models).toBeUndefined();
+    expect(result.cfg.agents?.defaults?.agentRuntime).toBeUndefined();
+    expect(result.warnings).toStrictEqual([
+      [
+        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+        "- agents.defaults.compaction.model: openai/gpt-5.4 is ignored while this agent uses Codex runtime.",
+        "- agents.defaults.compaction.provider: lossless-claw is ignored while this agent uses Codex runtime.",
+        "- Move or remove shared `agents.defaults.compaction.model/provider` settings manually; doctor keeps shared defaults while non-Codex agents can inherit them.",
+      ].join("\n"),
+    ]);
+  });
+
+  it("does not broaden runtime policy from kept compaction-only refs", () => {
+    const result = maybeRepairCodexRoutes({
+      cfg: {
+        models: {
+          providers: {
+            openai: {
+              baseUrl: "https://api.openai.com/v1",
+              agentRuntime: { id: "pi" },
+              models: [],
+            },
+          },
+        },
+        agents: {
+          defaults: {
+            agentRuntime: { id: "codex" },
+            model: "openai-codex/gpt-5.5",
+            heartbeat: {
+              model: "openai/gpt-5.4",
+            },
+            compaction: {
+              model: "openai-codex/gpt-5.4",
+              provider: "lossless-claw",
+            },
+          },
+          list: [
+            {
+              id: "worker",
+              model: "anthropic/claude-sonnet-4-6",
+            },
+          ],
+        },
+      } as OpenClawConfig,
+      shouldRepair: true,
+    });
+
+    expect(result.cfg.agents?.defaults?.model).toBe("openai/gpt-5.5");
+    expect(result.cfg.agents?.defaults?.heartbeat?.model).toBe("openai/gpt-5.4");
+    expect(result.cfg.agents?.defaults?.compaction).toEqual({
+      model: "openai/gpt-5.4",
+      provider: "lossless-claw",
+    });
+    expect(result.cfg.agents?.defaults?.models?.["openai/gpt-5.4"]).toBeUndefined();
+    expect(
+      resolveAgentHarnessPolicy({
+        provider: "openai",
+        modelId: "gpt-5.4",
+        config: result.cfg,
+      }).runtime,
+    ).toBe("pi");
+  });
+
   it("repairs configured Codex model refs to canonical OpenAI refs with model-scoped Codex runtime", () => {
     const result = maybeRepairCodexRoutes({
       cfg: {

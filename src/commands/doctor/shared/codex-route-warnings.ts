@@ -14,12 +14,16 @@ type CodexRouteHit = {
   canonicalModel: string;
   runtime?: string;
 };
+type CompactionOverrideKey = "model" | "provider";
 type UnsupportedCodexCompactionOverride = {
   path: string;
+  key: CompactionOverrideKey;
   value: string;
 };
+type SharedDefaultCompactionOverrideConsumers = Record<CompactionOverrideKey, boolean>;
 
 type MutableRecord = Record<string, unknown>;
+const COMPACTION_OVERRIDE_KEYS: readonly CompactionOverrideKey[] = ["model", "provider"];
 type SessionRouteRepairResult = {
   changed: boolean;
   sessionKeys: string[];
@@ -247,13 +251,10 @@ function collectUnsupportedCodexCompactionOverridesForAgent(params: {
   ) {
     return [];
   }
-  const candidates: Array<{ key: "model" | "provider"; value: unknown }> = [
-    { key: "model", value: compaction.model },
-    { key: "provider", value: compaction.provider },
-  ];
+  const candidates = COMPACTION_OVERRIDE_KEYS.map((key) => ({ key, value: compaction[key] }));
   return candidates.flatMap(({ key, value }) =>
     typeof value === "string" && value.trim()
-      ? [{ path: `${params.path}.compaction.${key}`, value: value.trim() }]
+      ? [{ path: `${params.path}.compaction.${key}`, key, value: value.trim() }]
       : [],
   );
 }
@@ -297,6 +298,88 @@ function collectUnsupportedCodexCompactionOverrides(params: {
     );
   }
   return hits;
+}
+
+function getSharedDefaultCompactionOverrideConsumers(params: {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  ignoreLegacyAgentRuntimePins?: boolean;
+}): SharedDefaultCompactionOverrideConsumers {
+  const consumers: SharedDefaultCompactionOverrideConsumers = { model: false, provider: false };
+  const defaults = params.cfg.agents?.defaults;
+  const defaultCompaction = asMutableRecord(defaults?.compaction);
+  if (!defaultCompaction) {
+    return consumers;
+  }
+  const hasDefaultModel =
+    typeof defaultCompaction.model === "string" && defaultCompaction.model.trim();
+  const hasDefaultProvider =
+    typeof defaultCompaction.provider === "string" && defaultCompaction.provider.trim();
+  if (!hasDefaultModel && !hasDefaultProvider) {
+    return consumers;
+  }
+  const defaultsRuntime = defaults?.agentRuntime;
+  const inheritedModelRef = readAgentPrimaryModelRef(defaults);
+  const defaultUsesCodexCompaction = agentUsesCodexRuntimeForCompaction({
+    cfg: params.cfg,
+    agent: defaults,
+    currentRuntime: resolveRuntime({
+      env: params.env,
+      defaultsRuntime: params.ignoreLegacyAgentRuntimePins ? undefined : defaultsRuntime,
+    }),
+  });
+  if (!defaultUsesCodexCompaction) {
+    consumers.model ||= Boolean(hasDefaultModel);
+    consumers.provider ||= Boolean(hasDefaultProvider);
+    if ((!hasDefaultModel || consumers.model) && (!hasDefaultProvider || consumers.provider)) {
+      return consumers;
+    }
+  }
+  const agents = Array.isArray(params.cfg.agents?.list) ? params.cfg.agents.list : [];
+  if (agents.length === 0) {
+    return consumers;
+  }
+  for (const [index, agent] of agents.entries()) {
+    const agentRecord = asMutableRecord(agent);
+    if (!agentRecord) {
+      continue;
+    }
+    const compaction = asMutableRecord(agentRecord.compaction);
+    const inheritsDefaultModel =
+      Boolean(hasDefaultModel) &&
+      !(typeof compaction?.model === "string" && compaction.model.trim());
+    const inheritsDefaultProvider =
+      Boolean(hasDefaultProvider) &&
+      !(typeof compaction?.provider === "string" && compaction.provider.trim());
+    if (!inheritsDefaultModel && !inheritsDefaultProvider) {
+      continue;
+    }
+    const id =
+      typeof agentRecord.id === "string" && agentRecord.id.trim()
+        ? agentRecord.id.trim()
+        : String(index);
+    const usesCodexCompaction = agentUsesCodexRuntimeForCompaction({
+      cfg: params.cfg,
+      agent: agentRecord,
+      agentId: id,
+      currentRuntime: resolveRuntime({
+        env: params.env,
+        agentRuntime: params.ignoreLegacyAgentRuntimePins
+          ? undefined
+          : asAgentRuntimePolicyConfig(agentRecord.agentRuntime),
+        defaultsRuntime: params.ignoreLegacyAgentRuntimePins ? undefined : defaultsRuntime,
+      }),
+      inheritedModelRef,
+    });
+    if (!usesCodexCompaction) {
+      consumers.model ||= inheritsDefaultModel;
+      consumers.provider ||= inheritsDefaultProvider;
+      if ((!hasDefaultModel || consumers.model) && (!hasDefaultProvider || consumers.provider)) {
+        break;
+      }
+    }
+  }
+  return consumers;
 }
 
 function collectModelsMapRefs(params: {
@@ -703,6 +786,7 @@ function rewriteAgentModelRefs(params: {
   currentRuntime?: string;
   inheritedModelRef?: string;
   rewriteModelsMap?: boolean;
+  preserveUnsupportedCompactionOverrides?: SharedDefaultCompactionOverrideConsumers;
   runtimePolicyChanges: string[];
   unsupportedCompactionChanges: string[];
 }): void {
@@ -773,8 +857,17 @@ function rewriteAgentModelRefs(params: {
       agent,
       compaction,
       path: params.path,
+      preserve: params.preserveUnsupportedCompactionOverrides,
       changes: params.unsupportedCompactionChanges,
     });
+    if (params.preserveUnsupportedCompactionOverrides?.model) {
+      rewriteStringModelSlot({
+        hits: params.hits,
+        container: compaction,
+        key: "model",
+        path: `${params.path}.compaction.model`,
+      });
+    }
   } else {
     rewriteStringModelSlotIfCanonicalCodexRuntime({
       cfg: params.cfg,
@@ -808,12 +901,16 @@ function removeUnsupportedCodexCompactionOverrides(params: {
   agent: MutableRecord;
   compaction: MutableRecord | undefined;
   path: string;
+  preserve?: Partial<Record<CompactionOverrideKey, boolean>>;
   changes: string[];
 }): void {
   if (!params.compaction) {
     return;
   }
-  for (const key of ["model", "provider"]) {
+  for (const key of COMPACTION_OVERRIDE_KEYS) {
+    if (params.preserve?.[key]) {
+      continue;
+    }
     const value = params.compaction[key];
     if (typeof value !== "string" || !value.trim()) {
       continue;
@@ -1013,9 +1110,10 @@ function clearConfigLegacyAgentRuntimePolicies(cfg: OpenClawConfig): string[] {
   return changes;
 }
 
-function rewriteConfigModelRefs(params: {
+function rewriteConfigModelRefsWithCompactionPolicy(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
+  preserveSharedDefaultCompactionOverrides: SharedDefaultCompactionOverrideConsumers;
 }): ConfigRouteRepairResult {
   const nextConfig = structuredClone(params.cfg);
   const hits: CodexRouteHit[] = [];
@@ -1029,6 +1127,7 @@ function rewriteConfigModelRefs(params: {
     path: "agents.defaults",
     currentRuntime: resolveRuntime({ env: params.env, defaultsRuntime }),
     rewriteModelsMap: true,
+    preserveUnsupportedCompactionOverrides: params.preserveSharedDefaultCompactionOverrides,
     runtimePolicyChanges,
     unsupportedCompactionChanges,
   });
@@ -1114,8 +1213,12 @@ function rewriteConfigModelRefs(params: {
     key: "model",
     path: "channels.discord.voice.model",
   });
-  const runtimePinChanges =
-    hits.length > 0 ? clearConfigLegacyAgentRuntimePolicies(nextConfig) : [];
+  const shouldClearRuntimePins = hits.some(
+    (hit) => hit.path !== "agents.defaults.compaction.model",
+  );
+  const runtimePinChanges = shouldClearRuntimePins
+    ? clearConfigLegacyAgentRuntimePolicies(nextConfig)
+    : [];
   return {
     cfg:
       hits.length > 0 ||
@@ -1131,8 +1234,49 @@ function rewriteConfigModelRefs(params: {
   };
 }
 
+function configRepairWouldClearLegacyRuntimePins(params: {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+}): boolean {
+  const dryRun = rewriteConfigModelRefsWithCompactionPolicy({
+    cfg: params.cfg,
+    env: params.env,
+    preserveSharedDefaultCompactionOverrides: { model: true, provider: true },
+  });
+  return dryRun.changes.some((hit) => hit.path !== "agents.defaults.compaction.model");
+}
+
+function rewriteConfigModelRefs(params: {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+}): ConfigRouteRepairResult {
+  const preserveSharedDefaultCompactionOverrides = getSharedDefaultCompactionOverrideConsumers({
+    cfg: params.cfg,
+    env: params.env,
+    ignoreLegacyAgentRuntimePins: configRepairWouldClearLegacyRuntimePins(params),
+  });
+  return rewriteConfigModelRefsWithCompactionPolicy({
+    cfg: params.cfg,
+    env: params.env,
+    preserveSharedDefaultCompactionOverrides,
+  });
+}
+
 function formatCodexRouteChange(hit: CodexRouteHit): string {
   return `${hit.path}: ${hit.model} -> ${hit.canonicalModel}.`;
+}
+
+function formatUnsupportedCompactionWarning(params: {
+  hits: UnsupportedCodexCompactionOverride[];
+  fixHint: string;
+}): string {
+  return [
+    "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
+    ...params.hits.map(
+      (hit) => `- ${hit.path}: ${hit.value} is ignored while this agent uses Codex runtime.`,
+    ),
+    params.fixHint,
+  ].join("\n");
 }
 
 export function collectCodexRouteWarnings(params: {
@@ -1141,6 +1285,11 @@ export function collectCodexRouteWarnings(params: {
 }): string[] {
   const hits = collectConfigModelRefs(params.cfg, params.env);
   const unsupportedCompactionOverrides = collectUnsupportedCodexCompactionOverrides(params);
+  const sharedDefaultCompactionConsumers = getSharedDefaultCompactionOverrideConsumers({
+    cfg: params.cfg,
+    env: params.env,
+    ignoreLegacyAgentRuntimePins: configRepairWouldClearLegacyRuntimePins(params),
+  });
   const warnings: string[] = [];
   if (hits.length > 0) {
     warnings.push(
@@ -1156,15 +1305,32 @@ export function collectCodexRouteWarnings(params: {
       ].join("\n"),
     );
   }
-  if (unsupportedCompactionOverrides.length > 0) {
+  const preservedSharedDefaultHits = unsupportedCompactionOverrides.filter(
+    (hit) =>
+      hit.path.startsWith("agents.defaults.compaction.") &&
+      sharedDefaultCompactionConsumers[hit.key],
+  );
+  const fixableHits = unsupportedCompactionOverrides.filter(
+    (hit) =>
+      !hit.path.startsWith("agents.defaults.compaction.") ||
+      !sharedDefaultCompactionConsumers[hit.key],
+  );
+  if (preservedSharedDefaultHits.length > 0) {
     warnings.push(
-      [
-        "- Codex runtime uses native server-side compaction and ignores OpenClaw compaction summarizer overrides.",
-        ...unsupportedCompactionOverrides.map(
-          (hit) => `- ${hit.path}: ${hit.value} is ignored while this agent uses Codex runtime.`,
-        ),
-        "- Run `openclaw doctor --fix`: it removes unsupported Codex compaction overrides.",
-      ].join("\n"),
+      formatUnsupportedCompactionWarning({
+        hits: preservedSharedDefaultHits,
+        fixHint:
+          "- Move or remove shared `agents.defaults.compaction.model/provider` settings manually; doctor keeps shared defaults while non-Codex agents can inherit them.",
+      }),
+    );
+  }
+  if (fixableHits.length > 0) {
+    warnings.push(
+      formatUnsupportedCompactionWarning({
+        hits: fixableHits,
+        fixHint:
+          "- Run `openclaw doctor --fix`: it removes unsupported Codex compaction overrides.",
+      }),
     );
   }
   return warnings;
